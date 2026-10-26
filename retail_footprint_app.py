@@ -547,8 +547,8 @@ with st.container(key="sticky_top"):
 geoms = level_geometries(geo_bytes, level, TOLERANCE)
 
 wf_region, wf_national_total = workforce_by_region(workforce)
-# Workforce hover only on the national view: Region level with no region filter applied
-show_workforce = level == "region" and not chosen_regions and bool(wf_region)
+# Workforce hover on every Region-level view (with or without a region filter)
+show_workforce = level == "region" and bool(wf_region)
 
 features, missing_geometry = [], 0
 for _, row in areas.iterrows():
