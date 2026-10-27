@@ -675,7 +675,7 @@ metric_cmap = None
 if has_pop and colour_by == "Population density":
     metric_cmap = quantile_colormap(
         [f["properties"].get("_metric") for f in features],
-        f"People per km² by {level_label.lower()}",
+        f"People per km² by {level_label.lower()} (equal-count classes)",
     )
 
 
@@ -708,7 +708,7 @@ fmap = folium.Map(
     location=[(miny + maxy) / 2, (minx + maxx) / 2],
     zoom_start=7,
     tiles=None,
-    scrollWheelZoom=False,   # mouse wheel scrolls the page; zoom with +/- , double-click or pinch
+    scrollWheelZoom=True,    # mouse wheel over the map zooms it
 )
 folium.TileLayer(
     tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -796,7 +796,7 @@ fmap.fit_bounds([[miny, minx], [maxy, maxx]], padding=(10, 10))
 st.markdown(
     '<div class="mtn-section-label">Uganda Retail Footprint</div>'
     '<div class="mtn-jump"><a href="#shops-table">&#8595; Jump to table</a> '
-    '<span style="color:#6B6B6B;font-weight:600">&nbsp;Scroll wheel moves the page; zoom with + / – or double-click.</span></div>',
+    '<span style="color:#6B6B6B;font-weight:600">&nbsp;Scroll wheel over the map zooms; scroll beside it, or use the link, to move down the page.</span></div>',
     unsafe_allow_html=True,
 )
 st_folium(
