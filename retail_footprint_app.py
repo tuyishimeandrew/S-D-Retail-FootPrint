@@ -12,10 +12,13 @@ from pathlib import Path
 
 import branca.colormap as cm
 import folium
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import streamlit as st
 from shapely.geometry import mapping, shape
+from shapely import contains_xy
+from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 # =========================================================
@@ -326,7 +329,15 @@ def load_tables(xlsx_bytes):
     asg = asg[["ShopID", "AdminLevel", "AreaKey", "AreaLabel"]]
 
     workforce.columns = [str(c).strip() for c in workforce.columns]
-    return shops, bnd, asg, workforce
+
+    # Optional sheets: population per area (site catchment populations summed by polygon)
+    # and the raw per-site points used for the heatmap
+    pop_area = book.parse("AreaPopulation") if "AreaPopulation" in book.sheet_names else pd.DataFrame()
+    pop_sites = book.parse("SitePopulation") if "SitePopulation" in book.sheet_names else pd.DataFrame()
+    if not pop_area.empty:
+        pop_area["AdminLevel"] = pop_area["AdminLevel"].astype(str).str.strip().str.lower()
+        pop_area["AreaKey"] = pop_area["AreaKey"].astype(str).str.strip()
+    return shops, bnd, asg, workforce, pop_area, pop_sites
 
 
 @st.cache_data(show_spinner="Preparing boundary shapes...")
@@ -353,6 +364,89 @@ def level_geometries(parquet_bytes, level, tolerance):
 # =========================================================
 def slug(text):
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "x"
+
+
+POP_RAMP = ["#FFF3C4", "#FFD27A", "#FCA94A", "#F27B2C", "#D94A1E", "#A8201A", "#5E0B15"]
+POP_VIEWS = {
+    "Dots (1 dot = 1,000 people)": "Dots",
+    "Density (people per km²)": "Population density",
+    "Total population": "Population",
+}
+DOT_PEOPLE = 1000
+DOT_COLOR = (178, 34, 34)   # firebrick red; overlaps darken, so dense areas read as solid red
+# typical catchment spread (km) around a site, by site area type
+SPREAD_KM = {"dense urban": 0.6, "urban": 1.2, "sub urban": 2.5, "rural": 5.0}
+
+
+@st.cache_data(show_spinner="Scattering population dots...")
+def make_population_dots(sites_df, country_json, seed=7):
+    """1 dot per 1,000 people, scattered around each site, kept inside Uganda."""
+    rng = np.random.default_rng(seed)
+    sites_df = sites_df.dropna(subset=["Latitude", "Longitude", "Population"])
+    base = sites_df["Population"].to_numpy(float) / DOT_PEOPLE
+    n = np.floor(base).astype(int) + (rng.random(len(base)) < (base - np.floor(base))).astype(int)
+    idx = np.repeat(np.arange(len(sites_df)), n)
+    lon0 = sites_df["Longitude"].to_numpy(float)[idx]
+    lat0 = sites_df["Latitude"].to_numpy(float)[idx]
+    kinds = sites_df["AreaType"].astype(str).str.strip().str.lower() if "AreaType" in sites_df else None
+    sig_km = (kinds.map(SPREAD_KM).fillna(3.0).to_numpy(float) if kinds is not None
+              else np.full(len(sites_df), 3.0))[idx]
+    country = shape(json.loads(country_json))
+    lon, lat = lon0.copy(), lat0.copy()
+    todo = np.ones(len(lon), dtype=bool)
+    for _ in range(8):   # resample dots that landed in the lake / outside the border
+        k = todo.sum()
+        if k == 0:
+            break
+        lon[todo] = lon0[todo] + rng.normal(0, 1, k) * sig_km[todo] / 111.0
+        lat[todo] = lat0[todo] + rng.normal(0, 1, k) * sig_km[todo] / 111.0
+        todo = ~contains_xy(country, lon, lat)
+    keep = ~todo
+    return lon[keep], lat[keep]
+
+
+def add_dots_layer(fmap, lon, lat):
+    """Draw the dots as canvas circle markers: constant pixel size, crisp at every zoom, ignores the mouse."""
+    pts = json.dumps([[round(float(a), 4), round(float(b), 4)] for a, b in zip(lat, lon)], separators=(",", ":"))
+    r, g, b = DOT_COLOR
+    js = f"""
+    (function() {{
+      var map = {fmap.get_name()};
+      if (!map.getPane('popDots')) {{
+        map.createPane('popDots');
+        map.getPane('popDots').style.zIndex = 450;
+        map.getPane('popDots').style.pointerEvents = 'none';
+      }}
+      var renderer = L.canvas({{pane: 'popDots', padding: 0.3}});
+      var pts = {pts};
+      var layer = L.layerGroup();
+      for (var i = 0; i < pts.length; i++) {{
+        L.circleMarker(pts[i], {{renderer: renderer, pane: 'popDots', radius: 1.6, stroke: false,
+          fillColor: 'rgb({r},{g},{b})', fillOpacity: 0.5, interactive: false}}).addTo(layer);
+      }}
+      layer.addTo(map);
+    }})();
+    """
+    fmap.get_root().script.add_child(folium.Element(js))
+
+
+def quantile_colormap(values, caption):
+    """Equal-count (quantile) classes so a few huge areas don't wash out the rest."""
+    vals = np.asarray([v for v in values if v is not None and np.isfinite(v) and v > 0], dtype=float)
+    if vals.size == 0:
+        return None
+    qs = np.unique(np.quantile(vals, np.linspace(0, 1, len(POP_RAMP) + 1)))
+    if len(qs) < 3:
+        qs = np.array([vals.min(), vals.max() + 1.0])
+    colors = POP_RAMP[: len(qs) - 1]
+    cmap = cm.StepColormap(colors, index=list(qs), vmin=float(qs[0]), vmax=float(qs[-1]), caption=caption)
+    return cmap
+
+
+def fmt_big(v):
+    if v is None or not np.isfinite(v):
+        return "n/a"
+    return f"{v:,.0f}"
 
 
 def level_title(level):
@@ -430,7 +524,7 @@ with st.container(key="sticky_top"):
         st.stop()
 
     try:
-        shops, boundaries, assignments, workforce = load_tables(xlsx_bytes)
+        shops, boundaries, assignments, workforce, pop_area, pop_sites = load_tables(xlsx_bytes)
     except Exception as exc:
         st.error(f"Could not read the prepared workbook: {exc}")
         st.stop()
@@ -460,6 +554,7 @@ with st.container(key="sticky_top"):
     )
 
     areas = boundaries[boundaries["admin_level"] == level].copy()
+    areas_all_at_level = areas.copy()
 
     # --- Region dropdown when Region is the selected level ---
     # (Otherwise, region filtering happens through the parent-column loop below.)
@@ -495,6 +590,17 @@ with st.container(key="sticky_top"):
 
     show_shops = st.sidebar.checkbox("Show shop points", value=True)
 
+    has_pop = not pop_area.empty
+    colour_by = "Shops"   # only used if the workbook has no population sheets
+    if has_pop:
+        st.sidebar.header("Population")
+        _view = st.sidebar.radio(
+            "Map view", list(POP_VIEWS),
+            help="Density shows where people are packed in, whatever the size of the area. "
+                 "Total shows raw headcount per area. Dots scatter 1 dot per 1,000 people.",
+        )
+        colour_by = POP_VIEWS[_view]
+
     if areas.empty:
         st.warning("No areas match these filters.")
         st.stop()
@@ -513,13 +619,23 @@ with st.container(key="sticky_top"):
     )
     counts["Total"] = counts[selected_designs].sum(axis=1)
 
+    if has_pop:
+        _pa = pop_area[pop_area["AdminLevel"] == level].set_index("AreaKey")
+        pop_by_key = _pa["Population"].reindex(area_keys).fillna(0)
+        dens_by_key = _pa["PopDensityKm2"].reindex(area_keys)
+    else:
+        pop_by_key = pd.Series(0.0, index=area_keys)
+        dens_by_key = pd.Series(np.nan, index=area_keys)
+    shops_total = counts["Total"].reindex(area_keys)
+    pps_by_key = (pop_by_key / shops_total.replace(0, np.nan))
+
     n_areas = len(areas)
     areas_without_shops = int((counts["Total"] == 0).sum())
     shops_in_areas = int(counts["Total"].sum())
     level_label = level_title(level)
 
     # KPIs — custom HTML cards, guaranteed wrapping
-    kpi_cols = st.columns(3 + len(selected_designs), gap="small")
+    kpi_cols = st.columns(3 + len(selected_designs) + (1 if has_pop else 0), gap="small")
     kpi_cols[0].markdown(
         kpi_card_html(f"{level_label} areas shown", f"{n_areas:,}"),
         unsafe_allow_html=True,
@@ -532,7 +648,12 @@ with st.container(key="sticky_top"):
         kpi_card_html(f"{level_label} areas without shops", f"{areas_without_shops:,}"),
         unsafe_allow_html=True,
     )
-    for col, design in zip(kpi_cols[3:], selected_designs):
+    if has_pop:
+        kpi_cols[-1].markdown(
+            kpi_card_html("Population in these areas", fmt_big(pop_by_key.sum())),
+            unsafe_allow_html=True,
+        )
+    for col, design in zip(kpi_cols[3:3 + len(selected_designs)], selected_designs):
         col.markdown(
             kpi_card_html(
                 f"Avg {design.title()} per {level_label}",
@@ -563,6 +684,22 @@ for _, row in areas.iterrows():
     }
     for design in selected_designs:
         props[f"n_{slug(design)}"] = int(counts.loc[row["key"], design])
+    if has_pop:
+        _p = float(pop_by_key.get(row["key"], 0))
+        _d = dens_by_key.get(row["key"])
+        _pp = pps_by_key.get(row["key"])
+        _n = int(counts.loc[row["key"], "Total"])
+        props["pop_txt"] = fmt_big(_p) if _p > 0 else "no site data"
+        props["dens_txt"] = f"{_d:,.0f} / km²" if _d is not None and np.isfinite(_d) and _p > 0 else "n/a"
+        props["pps_txt"] = (
+            f"{_pp:,.0f}" if _pp is not None and np.isfinite(_pp)
+            else ("no shops" if _p > 0 and _n == 0 else "n/a")
+        )
+        props["_metric"] = {
+            "Population": _p if _p > 0 else None,
+            "Population density": float(_d) if _d is not None and np.isfinite(_d) and _p > 0 else None,
+        }.get(colour_by)
+        props["_noshop"] = bool(_p > 0 and _n == 0)
     if show_workforce:
         perm, contract, total = wf_region.get(region_norm(row["label"]), (None, None, None))
         if perm is None:
@@ -586,9 +723,25 @@ vmax = max(1, int(counts["Total"].max()))
 colormap = cm.LinearColormap(MTN_RAMP, vmin=0, vmax=vmax)
 colormap.caption = f"Shops per {level_label.lower()}"
 
+metric_cmap = None
+if has_pop and colour_by in ("Population", "Population density"):
+    _caption = {
+        "Population": f"Population per {level_label.lower()} (equal-count classes)",
+        "Population density": "People per km² (equal-count classes)",
+    }[colour_by]
+    metric_cmap = quantile_colormap([f["properties"].get("_metric") for f in features], _caption)
+
 
 def style_function(feature):
-    total = feature["properties"]["total_shops"]
+    props = feature["properties"]
+    if has_pop and colour_by == "Dots":
+        return {"fillColor": "#FFFFFF", "color": "#555555", "weight": 0.8, "fillOpacity": 0.55}
+    if metric_cmap is not None:
+        v = props.get("_metric")
+        if v is None or v <= 0:
+            return {"fillColor": "#EFEFEF", "color": "#BDBDBD", "weight": 1, "fillOpacity": 0.45}
+        return {"fillColor": metric_cmap(v), "color": MTN_BLACK, "weight": 1, "fillOpacity": 0.78}
+    total = props["total_shops"]
     if total == 0:
         return {"fillColor": "#EFEFEF", "color": "#BDBDBD", "weight": 1, "fillOpacity": 0.45}
     return {"fillColor": colormap(total), "color": MTN_BLACK, "weight": 1, "fillOpacity": 0.72}
@@ -627,8 +780,13 @@ fmap.get_root().header.add_child(
     )
 )
 
-tooltip_fields = ["label", "level", "total_shops"] + [f"n_{slug(d)}" for d in selected_designs]
-tooltip_aliases = ["Area", "Level", "Total shops"] + [d.title() for d in selected_designs]
+tooltip_fields = ["label", "level"]
+tooltip_aliases = ["Area", "Level"]
+if has_pop:
+    tooltip_fields += ["pop_txt", "dens_txt", "pps_txt"]
+    tooltip_aliases += ["Population", "Density", "People per shop"]
+tooltip_fields += ["total_shops"] + [f"n_{slug(d)}" for d in selected_designs]
+tooltip_aliases += ["Total shops"] + [d.title() for d in selected_designs]
 if show_workforce:
     tooltip_fields += ["wf_perm", "wf_contract", "wf_total"]
     tooltip_aliases += ["Permanent staff", "Contract staff", "Total staff"]
@@ -642,7 +800,26 @@ folium.GeoJson(
         fields=tooltip_fields, aliases=tooltip_aliases, sticky=True, localize=True,
     ),
 ).add_to(fmap)
-colormap.add_to(fmap)
+(metric_cmap if metric_cmap is not None else colormap).add_to(fmap)
+
+if has_pop and colour_by == "Dots" and not pop_sites.empty:
+    _country = level_geometries(geo_bytes, "country", TOLERANCE)
+    if _country:
+        _cj = json.dumps(next(iter(_country.values()))["geometry"])
+        _dlon, _dlat = make_population_dots(pop_sites, _cj)
+        _drawn = [shape(f["geometry"]) for f in features]
+        if len(features) < len(areas_all_at_level):   # filtered view: keep dots inside the shown areas
+            _keep = contains_xy(unary_union(_drawn), _dlon, _dlat)
+            _dlon, _dlat = _dlon[_keep], _dlat[_keep]
+        add_dots_layer(fmap, _dlon, _dlat)
+        fmap.get_root().html.add_child(folium.Element(
+            "<div style='position:fixed;bottom:30px;right:12px;z-index:9999;background:#fff;"
+            "padding:8px 12px;border:2px solid #B1121B;border-radius:8px;font-size:12px;"
+            "font-family:Montserrat,sans-serif'>"
+            "<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
+            "background:#B1121B;margin-right:6px'></span>"
+            f"1 dot = {DOT_PEOPLE:,} people ({len(_dlon):,} dots)</div>"
+        ))
 
 if show_shops:
     shop_points = (
@@ -698,7 +875,7 @@ st_folium(
     use_container_width=True,
     height=720,
     returned_objects=[],
-    key=f"map_v3_{level}",   # bumped so cached old map is discarded
+    key=f"map_v5_{level}_{colour_by}",   # bumped so cached old map is discarded
 )
 
 # ---------------------------------------------------------
@@ -717,6 +894,11 @@ table = table.merge(
     counts.reset_index().rename(columns={"index": "key", "AreaKey": "key"}),
     on="key", how="left",
 )
+
+if has_pop:
+    table["Population"] = table["key"].map(pop_by_key).fillna(0).round(0).astype(int)
+    table["Pop density (per km²)"] = table["key"].map(dens_by_key).round(0)
+    table["People per shop"] = table["key"].map(pps_by_key).round(0)
 
 status = table["Total"].apply(lambda t: "Without shops" if t == 0 else "With shops")
 insert_at = list(table.columns).index("Total") + 1
