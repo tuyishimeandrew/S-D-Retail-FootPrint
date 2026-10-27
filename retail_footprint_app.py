@@ -17,8 +17,6 @@ import pandas as pd
 import pyarrow.parquet as pq
 import streamlit as st
 from shapely.geometry import mapping, shape
-from shapely import contains_xy
-from shapely.ops import unary_union
 from streamlit_folium import st_folium
 
 # =========================================================
@@ -367,69 +365,6 @@ def slug(text):
 
 
 POP_RAMP = ["#FFF3C4", "#FFD27A", "#FCA94A", "#F27B2C", "#D94A1E", "#A8201A", "#5E0B15"]
-POP_VIEWS = {
-    "Dots (1 dot = 1,000 people)": "Dots",
-    "Density (people per km²)": "Population density",
-    "Total population": "Population",
-}
-DOT_PEOPLE = 1000
-DOT_COLOR = (178, 34, 34)   # firebrick red; overlaps darken, so dense areas read as solid red
-# typical catchment spread (km) around a site, by site area type
-SPREAD_KM = {"dense urban": 0.6, "urban": 1.2, "sub urban": 2.5, "rural": 5.0}
-
-
-@st.cache_data(show_spinner="Scattering population dots...")
-def make_population_dots(sites_df, country_json, seed=7):
-    """1 dot per 1,000 people, scattered around each site, kept inside Uganda."""
-    rng = np.random.default_rng(seed)
-    sites_df = sites_df.dropna(subset=["Latitude", "Longitude", "Population"])
-    base = sites_df["Population"].to_numpy(float) / DOT_PEOPLE
-    n = np.floor(base).astype(int) + (rng.random(len(base)) < (base - np.floor(base))).astype(int)
-    idx = np.repeat(np.arange(len(sites_df)), n)
-    lon0 = sites_df["Longitude"].to_numpy(float)[idx]
-    lat0 = sites_df["Latitude"].to_numpy(float)[idx]
-    kinds = sites_df["AreaType"].astype(str).str.strip().str.lower() if "AreaType" in sites_df else None
-    sig_km = (kinds.map(SPREAD_KM).fillna(3.0).to_numpy(float) if kinds is not None
-              else np.full(len(sites_df), 3.0))[idx]
-    country = shape(json.loads(country_json))
-    lon, lat = lon0.copy(), lat0.copy()
-    todo = np.ones(len(lon), dtype=bool)
-    for _ in range(8):   # resample dots that landed in the lake / outside the border
-        k = todo.sum()
-        if k == 0:
-            break
-        lon[todo] = lon0[todo] + rng.normal(0, 1, k) * sig_km[todo] / 111.0
-        lat[todo] = lat0[todo] + rng.normal(0, 1, k) * sig_km[todo] / 111.0
-        todo = ~contains_xy(country, lon, lat)
-    keep = ~todo
-    return lon[keep], lat[keep]
-
-
-def add_dots_layer(fmap, lon, lat):
-    """Draw the dots as canvas circle markers: constant pixel size, crisp at every zoom, ignores the mouse."""
-    pts = json.dumps([[round(float(a), 4), round(float(b), 4)] for a, b in zip(lat, lon)], separators=(",", ":"))
-    r, g, b = DOT_COLOR
-    js = f"""
-    (function() {{
-      var map = {fmap.get_name()};
-      if (!map.getPane('popDots')) {{
-        map.createPane('popDots');
-        map.getPane('popDots').style.zIndex = 450;
-        map.getPane('popDots').style.pointerEvents = 'none';
-      }}
-      var renderer = L.canvas({{pane: 'popDots', padding: 0.3}});
-      var pts = {pts};
-      var layer = L.layerGroup();
-      for (var i = 0; i < pts.length; i++) {{
-        L.circleMarker(pts[i], {{renderer: renderer, pane: 'popDots', radius: 1.6, stroke: false,
-          fillColor: 'rgb({r},{g},{b})', fillOpacity: 0.5, interactive: false}}).addTo(layer);
-      }}
-      layer.addTo(map);
-    }})();
-    """
-    fmap.get_root().script.add_child(folium.Element(js))
-
-
 def quantile_colormap(values, caption):
     """Equal-count (quantile) classes so a few huge areas don't wash out the rest."""
     vals = np.asarray([v for v in values if v is not None and np.isfinite(v) and v > 0], dtype=float)
@@ -554,7 +489,6 @@ with st.container(key="sticky_top"):
     )
 
     areas = boundaries[boundaries["admin_level"] == level].copy()
-    areas_all_at_level = areas.copy()
 
     # --- Region dropdown when Region is the selected level ---
     # (Otherwise, region filtering happens through the parent-column loop below.)
@@ -593,13 +527,7 @@ with st.container(key="sticky_top"):
     has_pop = not pop_area.empty
     colour_by = "Shops"   # only used if the workbook has no population sheets
     if has_pop:
-        st.sidebar.header("Population")
-        _view = st.sidebar.radio(
-            "Map view", list(POP_VIEWS),
-            help="Density shows where people are packed in, whatever the size of the area. "
-                 "Total shows raw headcount per area. Dots scatter 1 dot per 1,000 people.",
-        )
-        colour_by = POP_VIEWS[_view]
+        colour_by = "Population density"   # map is always shaded by people per km²
 
     if areas.empty:
         st.warning("No areas match these filters.")
@@ -734,8 +662,6 @@ if has_pop and colour_by in ("Population", "Population density"):
 
 def style_function(feature):
     props = feature["properties"]
-    if has_pop and colour_by == "Dots":
-        return {"fillColor": "#FFFFFF", "color": "#555555", "weight": 0.8, "fillOpacity": 0.55}
     if metric_cmap is not None:
         v = props.get("_metric")
         if v is None or v <= 0:
@@ -802,25 +728,6 @@ folium.GeoJson(
 ).add_to(fmap)
 (metric_cmap if metric_cmap is not None else colormap).add_to(fmap)
 
-if has_pop and colour_by == "Dots" and not pop_sites.empty:
-    _country = level_geometries(geo_bytes, "country", TOLERANCE)
-    if _country:
-        _cj = json.dumps(next(iter(_country.values()))["geometry"])
-        _dlon, _dlat = make_population_dots(pop_sites, _cj)
-        _drawn = [shape(f["geometry"]) for f in features]
-        if len(features) < len(areas_all_at_level):   # filtered view: keep dots inside the shown areas
-            _keep = contains_xy(unary_union(_drawn), _dlon, _dlat)
-            _dlon, _dlat = _dlon[_keep], _dlat[_keep]
-        add_dots_layer(fmap, _dlon, _dlat)
-        fmap.get_root().html.add_child(folium.Element(
-            "<div style='position:fixed;bottom:30px;right:12px;z-index:9999;background:#fff;"
-            "padding:8px 12px;border:2px solid #B1121B;border-radius:8px;font-size:12px;"
-            "font-family:Montserrat,sans-serif'>"
-            "<span style='display:inline-block;width:10px;height:10px;border-radius:50%;"
-            "background:#B1121B;margin-right:6px'></span>"
-            f"1 dot = {DOT_PEOPLE:,} people ({len(_dlon):,} dots)</div>"
-        ))
-
 if show_shops:
     shop_points = (
         asg_level[asg_level["AreaKey"].isin(area_keys)]
@@ -875,7 +782,7 @@ st_folium(
     use_container_width=True,
     height=720,
     returned_objects=[],
-    key=f"map_v5_{level}_{colour_by}",   # bumped so cached old map is discarded
+    key=f"map_v6_{level}",   # bumped so cached old map is discarded
 )
 
 # ---------------------------------------------------------
