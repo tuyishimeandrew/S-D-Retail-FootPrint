@@ -67,8 +67,8 @@ st.markdown(
         top: 0 !important;
         z-index: 2147483647 !important;
         background: {MTN_GREY} !important;
-        padding: 14px 1.5rem 16px 1.5rem !important;
-        margin: 0 -1.5rem 1rem -1.5rem !important;
+        padding: 8px 1.5rem 10px 1.5rem !important;
+        margin: 0 -1.5rem 0.5rem -1.5rem !important;
         border-bottom: 4px solid {MTN_YELLOW} !important;
         box-shadow: 0 8px 16px -6px rgba(0,0,0,0.15) !important;
     }}
@@ -94,23 +94,23 @@ st.markdown(
     .mtn-header {{
         display: flex; align-items: center; gap: 20px;
         background: {MTN_BLACK};
-        padding: 20px 26px;
-        border-bottom: 6px solid {MTN_YELLOW};
+        padding: 10px 20px;
+        border-bottom: 5px solid {MTN_YELLOW};
         border-radius: 10px;
-        margin-bottom: 14px;
+        margin-bottom: 8px;
     }}
     .mtn-logo-chip {{
         background: {MTN_YELLOW};
         border-radius: 8px;
-        height: 64px; min-width: 84px;
+        height: 44px; min-width: 64px;
         display: flex; align-items: center; justify-content: center;
     }}
     .mtn-logo-text {{
-        font-weight: 900; font-size: 1.7rem;
+        font-weight: 900; font-size: 1.3rem;
         color: {MTN_BLACK}; letter-spacing: -1.5px; line-height: 1;
     }}
     .mtn-title {{
-        font-size: 2.1rem; font-weight: 900;
+        font-size: 1.5rem; font-weight: 900;
         color: #FFFFFF; letter-spacing: -0.5px;
         margin: 0; line-height: 1.1;
     }}
@@ -118,7 +118,7 @@ st.markdown(
     .mtn-subtitle {{
         font-size: 0.72rem; font-weight: 600;
         color: {MTN_YELLOW}; letter-spacing: 2.2px;
-        text-transform: uppercase; margin-top: 5px;
+        text-transform: uppercase; margin-top: 2px;
     }}
 
     /* ---------- Sidebar ---------- */
@@ -163,9 +163,9 @@ st.markdown(
         border: 1px solid {MTN_BORDER};
         border-left: 5px solid {MTN_YELLOW};
         border-radius: 8px;
-        padding: 14px 16px 12px 16px;
+        padding: 8px 14px 8px 14px;
         height: 100%;
-        min-height: 92px;
+        min-height: 66px;
         box-sizing: border-box;
         display: flex;
         flex-direction: column;
@@ -174,7 +174,7 @@ st.markdown(
     .mtn-kpi-value {{
         color: {MTN_BLACK};
         font-weight: 900;
-        font-size: 1.5rem;
+        font-size: 1.3rem;
         line-height: 1.1;
         margin: 0;
         padding: 0;
@@ -187,7 +187,7 @@ st.markdown(
         letter-spacing: 0.3px;
         text-transform: uppercase;
         line-height: 1.35;
-        margin-top: 8px;
+        margin-top: 4px;
         padding: 0;
         white-space: normal;
         word-wrap: break-word;
@@ -208,6 +208,12 @@ st.markdown(
         border-radius: 4px;
         margin: 8px 0 10px 0;
     }}
+    /* On short screens let the header scroll away instead of eating the map */
+    @media (max-height: 850px) {{
+        .st-key-sticky_top {{ position: static !important; }}
+    }}
+    .mtn-jump {{ font-size: 0.8rem; font-weight: 700; margin: 4px 0 8px 0; }}
+    .mtn-jump a {{ color: {MTN_BLACK}; background: {MTN_YELLOW}; padding: 4px 12px; border-radius: 4px; text-decoration: none; }}
     .stDownloadButton > button {{
         background: {MTN_YELLOW};
         color: {MTN_BLACK};
@@ -364,23 +370,61 @@ def slug(text):
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "x"
 
 
-POP_RAMP = ["#FFF3C4", "#FFD27A", "#FCA94A", "#F27B2C", "#D94A1E", "#A8201A", "#5E0B15"]
-def quantile_colormap(values, caption):
-    """Equal-count (quantile) classes so a few huge areas don't wash out the rest."""
+# Purple ramp: deliberately unlike the shop colours (yellow / orange / green / blue)
+POP_RAMP = ["#F5EEFB", "#E0C8F3", "#C79AE8", "#A86BD6", "#8442B8", "#5F2391", "#3A0F63"]
+def density_scale(values):
+    """Continuous log scale: every step in density shifts the shade, so 600k vs 3M never look alike.
+    Uses the full min-max range (no clipping) so the densest areas stay distinct from the next tier."""
     vals = np.asarray([v for v in values if v is not None and np.isfinite(v) and v > 0], dtype=float)
     if vals.size == 0:
         return None
-    qs = np.unique(np.quantile(vals, np.linspace(0, 1, len(POP_RAMP) + 1)))
-    if len(qs) < 3:
-        qs = np.array([vals.min(), vals.max() + 1.0])
-    colors = POP_RAMP[: len(qs) - 1]
-    cmap = cm.StepColormap(colors, index=list(qs), vmin=float(qs[0]), vmax=float(qs[-1]), caption=caption)
-    return cmap
+    logs = np.log10(vals)
+    lo, hi = logs.min(), logs.max()
+    if hi - lo < 0.1:
+        lo, hi = logs.min() - 0.05, logs.max() + 0.05
+    ramp = cm.LinearColormap(POP_RAMP, vmin=float(lo), vmax=float(hi))
+    return (lambda v: ramp(float(np.clip(np.log10(v), lo, hi)))), float(lo), float(hi)
+
+
+def density_legend_html(lo, hi, title):
+    nice = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+    ticks = [t for t in nice if lo <= np.log10(t) <= hi]
+    marks = "".join(
+        f"<div style='position:absolute;left:{(np.log10(t) - lo) / (hi - lo) * 100:.1f}%;top:14px;"
+        f"transform:translateX(-50%);font-size:11px'>{t:,}</div>"
+        f"<div style='position:absolute;left:{(np.log10(t) - lo) / (hi - lo) * 100:.1f}%;top:8px;"
+        f"width:1px;height:6px;background:#000'></div>"
+        for t in ticks
+    )
+    grad = ", ".join(POP_RAMP)
+    return (
+        "<div style='position:fixed;bottom:28px;right:12px;z-index:9999;background:#fff;"
+        "padding:8px 14px 8px 14px;border:2px solid #3A0F63;border-radius:8px;width:300px;"
+        "font-family:Montserrat,sans-serif;font-size:12px'>"
+        f"<div style='font-weight:700;margin-bottom:6px'>{title}</div>"
+        f"<div style='position:relative;height:36px'>"
+        f"<div style='height:8px;border:1px solid #000;background:linear-gradient(to right,{grad})'></div>"
+        f"{marks}</div>"
+        "<div style='font-size:10px;color:#6B6B6B'>Shade = density (log scale). Circle size = headcount. "
+        "Grey = no site data.</div></div>"
+    )
 
 
 def fmt_big(v):
     if v is None or not np.isfinite(v):
         return "n/a"
+    return f"{v:,.0f}"
+
+
+def fmt_compact(v):
+    """42,083,000 -> 42M, 2,753,000 -> 2.7M, 20,400 -> 20k."""
+    if v is None or not np.isfinite(v):
+        return "n/a"
+    a = abs(v)
+    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if a >= div:
+            x = v / div
+            return (f"{x:.1f}".rstrip("0").rstrip(".") if abs(x) < 10 else f"{x:.0f}") + suf
     return f"{v:,.0f}"
 
 
@@ -526,8 +570,13 @@ with st.container(key="sticky_top"):
 
     has_pop = not pop_area.empty
     colour_by = "Shops"   # only used if the workbook has no population sheets
+    show_pop_circles = False
     if has_pop:
         colour_by = "Population density"   # map is always shaded by people per km²
+        show_pop_circles = st.sidebar.checkbox(
+            "Population circles (size = headcount)", value=True,
+            help="Shade shows how crowded an area is; the circle shows how many people live there.",
+        )
 
     if areas.empty:
         st.warning("No areas match these filters.")
@@ -578,7 +627,7 @@ with st.container(key="sticky_top"):
     )
     if has_pop:
         kpi_cols[-1].markdown(
-            kpi_card_html("Population in these areas", fmt_big(pop_by_key.sum())),
+            kpi_card_html("Population in these areas", fmt_compact(pop_by_key.sum())),
             unsafe_allow_html=True,
         )
     for col, design in zip(kpi_cols[3:3 + len(selected_designs)], selected_designs):
@@ -652,12 +701,12 @@ colormap = cm.LinearColormap(MTN_RAMP, vmin=0, vmax=vmax)
 colormap.caption = f"Shops per {level_label.lower()}"
 
 metric_cmap = None
-if has_pop and colour_by in ("Population", "Population density"):
-    _caption = {
-        "Population": f"Population per {level_label.lower()} (equal-count classes)",
-        "Population density": "People per km² (equal-count classes)",
-    }[colour_by]
-    metric_cmap = quantile_colormap([f["properties"].get("_metric") for f in features], _caption)
+metric_range = None
+if has_pop and colour_by == "Population density":
+    _sc = density_scale([f["properties"].get("_metric") for f in features])
+    if _sc is not None:
+        metric_cmap, _lo, _hi = _sc
+        metric_range = (_lo, _hi)
 
 
 def style_function(feature):
@@ -666,7 +715,7 @@ def style_function(feature):
         v = props.get("_metric")
         if v is None or v <= 0:
             return {"fillColor": "#EFEFEF", "color": "#BDBDBD", "weight": 1, "fillOpacity": 0.45}
-        return {"fillColor": metric_cmap(v), "color": MTN_BLACK, "weight": 1, "fillOpacity": 0.78}
+        return {"fillColor": metric_cmap(v), "color": "#2B2B2B", "weight": 0.8, "fillOpacity": 0.82}
     total = props["total_shops"]
     if total == 0:
         return {"fillColor": "#EFEFEF", "color": "#BDBDBD", "weight": 1, "fillOpacity": 0.45}
@@ -689,6 +738,7 @@ fmap = folium.Map(
     location=[(miny + maxy) / 2, (minx + maxx) / 2],
     zoom_start=7,
     tiles=None,
+    scrollWheelZoom=False,   # mouse wheel scrolls the page; zoom with +/- , double-click or pinch
 )
 folium.TileLayer(
     tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -726,7 +776,26 @@ folium.GeoJson(
         fields=tooltip_fields, aliases=tooltip_aliases, sticky=True, localize=True,
     ),
 ).add_to(fmap)
-(metric_cmap if metric_cmap is not None else colormap).add_to(fmap)
+if metric_cmap is not None:
+    fmap.get_root().html.add_child(folium.Element(
+        density_legend_html(*metric_range, f"People per km² by {level_label.lower()}")))
+else:
+    colormap.add_to(fmap)
+
+if has_pop and show_pop_circles:
+    _rmax = {"country": 40, "region": 36, "territory": 30, "district": 24, "county": 18, "subcounty": 12}.get(level, 20)
+    _pmax = max([float(pop_by_key.get(f["properties"]["key"], 0)) for f in features] + [1.0])
+    for f in features:
+        _pv = float(pop_by_key.get(f["properties"]["key"], 0))
+        if _pv <= 0:
+            continue
+        _pt = shape(f["geometry"]).representative_point()
+        folium.CircleMarker(
+            location=[_pt.y, _pt.x],
+            radius=max(2.0, _rmax * (_pv / _pmax) ** 0.5),
+            color="#3A0F63", weight=1.2, fill=True, fill_color="#FFFFFF", fill_opacity=0.6,
+            tooltip=f"{f['properties']['label']}: {_pv:,.0f} people",
+        ).add_to(fmap)
 
 if show_shops:
     shop_points = (
@@ -774,22 +843,24 @@ fmap.fit_bounds([[miny, minx], [maxy, maxx]], padding=(10, 10))
 
 # ---- Full-width map ----
 st.markdown(
-    '<div class="mtn-section-label">Uganda Retail Footprint</div>',
+    '<div class="mtn-section-label">Uganda Retail Footprint</div>'
+    '<div class="mtn-jump"><a href="#shops-table">&#8595; Jump to table</a> '
+    '<span style="color:#6B6B6B;font-weight:600">&nbsp;Scroll wheel moves the page; zoom with + / – or double-click.</span></div>',
     unsafe_allow_html=True,
 )
 st_folium(
     fmap,
     use_container_width=True,
-    height=720,
+    height=560,
     returned_objects=[],
-    key=f"map_v6_{level}",   # bumped so cached old map is discarded
+    key=f"map_v8_{level}_{show_pop_circles}",   # bumped so cached old map is discarded
 )
 
 # ---------------------------------------------------------
 # Table
 # ---------------------------------------------------------
 st.markdown(
-    f'<div class="mtn-section-label">Shops per {level_label.lower()}</div>',
+    f'<div id="shops-table" class="mtn-section-label">Shops per {level_label.lower()}</div>',
     unsafe_allow_html=True,
 )
 
