@@ -675,7 +675,7 @@ metric_cmap = None
 if has_pop and colour_by == "Population density":
     metric_cmap = quantile_colormap(
         [f["properties"].get("_metric") for f in features],
-        f"People per km² by {level_label.lower()} (equal-count classes)",
+        f"People per km² by {level_label.lower()}",
     )
 
 
